@@ -1,6 +1,6 @@
 """
     This module implements the WSGI (Web Server Gateway Interface) layer for ViUR. This is the main entry
-    point for incomming http requests. The main class is the :class:BrowserHandler. Each request will get it's
+    point for incomming http requests. The main class is the :class:`Router`. Each request will get it's
     own instance of that class which then holds the reference to the request and response object.
     Additionally, this module defines the RequestValidator interface which provides a very early hook into the
     request processing (useful for global ratelimiting, DDoS prevention or access control).
@@ -43,7 +43,7 @@ class RequestValidator(ABC):
 
     @staticmethod
     @abstractmethod
-    def validate(request: 'BrowseHandler') -> t.Optional[tuple[int, str, str]]:
+    def validate(request: 'Router') -> t.Optional[tuple[int, str, str]]:
         """
             The function that checks the current request. If the request is valid, simply return None.
             If the request should be blocked, it must return a tuple of
@@ -93,7 +93,7 @@ class FetchMetaDataValidator(RequestValidator):
     name = "FetchMetaDataValidator"
 
     @staticmethod
-    def validate(request: 'BrowseHandler') -> t.Optional[tuple[int, str, str]]:
+    def validate(request: 'Router') -> t.Optional[tuple[int, str, str]]:
         """
             Resource-isolation gate based on the Fetch-Metadata request headers
             ("Sec-Fetch-Site"/"-Mode"/"-Dest"), as recommended by
