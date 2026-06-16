@@ -4,7 +4,7 @@ This file documents any relevant changes done to ViUR-core since version 3.
 
 ## [3.9.0.dev4]
 
-- fix: `FetchMetaDataValidator` accepts same-site and CORS-allow-listed cross-origin requests
+- fix: `FetchMetaDataValidator` accepts same-site (toggle `conf.security.fetch_metadata_allow_same_site`) and CORS-allow-listed cross-origin requests
 - feat: Add `conf.debug.trace_headers` to log request/response headers (sensitive headers redacted) (#1013)
 - chore: Deprecate endpoint `/vi/getStructure` (#1616)
 - doc: Docstrings for compute-related enum variants

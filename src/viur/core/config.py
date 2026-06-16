@@ -493,6 +493,24 @@ class Security(ConfigType):
     cors_max_age: datetime.timedelta | None = None
     """Allow caching"""
 
+    fetch_metadata_allow_same_site: bool = True
+    """Whether :class:`~viur.core.request.FetchMetaDataValidator` accepts
+    ``Sec-Fetch-Site: same-site`` requests (default; matches the web.dev reference policy).
+
+    "same-site" is a different origin on the *same registrable site* (eTLD+1, derived from the
+    Public Suffix List), e.g. an SPA on ``app.example.com`` calling ``api.example.com``. A cross-site
+    attacker is always ``cross-site``, never ``same-site``, so accepting same-site does not weaken the
+    gate against that threat model.
+
+    On shared cloud domains this is governed by the PSL: ``appspot.com``, ``*.r.appspot.com`` and
+    ``*.run.app`` are public suffixes, so different App Engine projects -- and even different
+    services/versions of one project (App Engine's ``-dot-`` URLs are single DNS labels) -- are
+    ``cross-site`` and therefore correctly NOT trusted by this option. Set it to ``False`` for hardened
+    deployments, or if the app is served under a shared parent domain that is *not* on the PSL (where
+    sibling tenants would otherwise count as same-site). Even when disabled, same-site top-level
+    navigations and CORS-allow-listed origins are still accepted.
+    """
+
     _mapping = {
         "contentSecurityPolicy": "content_security_policy",
         "referrerPolicy": "referrer_policy",

@@ -111,7 +111,7 @@ class FetchMetaDataValidator(RequestValidator):
         headers = request.request.headers
         site = headers.get("sec-fetch-site")
 
-        # Always-trusted values of Sec-Fetch-Site:
+        # Always trusted, regardless of configuration:
         #   * None          -- the client did not send Fetch-Metadata at all (non-browser
         #                       clients such as curl/SDKs, server-to-server calls, or old
         #                       browsers). Rejecting these would break every API consumer;
@@ -119,17 +119,22 @@ class FetchMetaDataValidator(RequestValidator):
         #   * "same-origin" -- our own origin.
         #   * "none"        -- user-initiated with no originating context (address bar,
         #                       bookmark, ...).
-        #   * "same-site"   -- a *different* origin but on the *same registrable site*
-        #                       (sub-domains, www<->apex, a differing port or scheme).
-        #                       A cross-site attacker is by definition "cross-site", never
-        #                       "same-site", so rejecting same-site adds essentially no
-        #                       protection against the threat model this gate targets while
-        #                       breaking very common multi-(sub)domain deployments (e.g. an
-        #                       SPA on app.example.com calling api.example.com). web.dev's
-        #                       reference policy accepts it, and so do we. (Previously this
-        #                       was allowed on the local dev server only, which broke the
-        #                       same legitimate pattern in production.)
-        if site in (None, "same-origin", "none", "same-site"):
+        if site in (None, "same-origin", "none"):
+            return None
+
+        # "same-site": a *different* origin on the same registrable site (eTLD+1, as derived from the
+        # Public Suffix List) -- e.g. an SPA on app.example.com calling api.example.com. A cross-site
+        # attacker is by definition "cross-site", never "same-site", so accepting it does not weaken
+        # the gate; web.dev's reference policy allows it too.
+        #
+        # This relies on the PSL: on shared cloud domains such as *.appspot.com, *.r.appspot.com and
+        # *.run.app (all public suffixes) other tenants -- and even other services/versions of the
+        # same project, because App Engine's "-dot-" URLs are single DNS labels -- are "cross-site"
+        # and therefore NOT trusted here. The only residual risk is a shared parent domain that is
+        # *not* on the PSL (sibling tenants would count as same-site); for those, or for general
+        # hardening, set conf.security.fetch_metadata_allow_same_site = False. Even when disabled, a
+        # same-site request can still pass below as a CORS-allow-listed origin or a top-level navigation.
+        if site == "same-site" and conf.security.fetch_metadata_allow_same_site:
             return None
 
         # Cross-site, but an Origin the project explicitly allow-listed for CORS.

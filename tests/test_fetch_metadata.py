@@ -20,11 +20,13 @@ class TestFetchMetaDataValidator(ViURTestCase):
         # Snapshot globals the tests mutate, so we don't pollute other tests.
         self._orig_cors = conf.security.cors_origins
         self._orig_dev = conf.instance.is_dev_server
+        self._orig_allow_same_site = conf.security.fetch_metadata_allow_same_site
 
     def tearDown(self):
         from viur.core.config import conf
         conf.security.cors_origins = self._orig_cors
         conf.instance.is_dev_server = self._orig_dev
+        conf.security.fetch_metadata_allow_same_site = self._orig_allow_same_site
         super().tearDown()
 
     def _validate(self, headers, is_post=False):
@@ -105,3 +107,30 @@ class TestFetchMetaDataValidator(ViURTestCase):
             "sec-fetch-mode": "cors",
             "Origin": "https://anything.example.org",
         }, is_post=True))
+
+    # --- same-site hardening flag (conf.security.fetch_metadata_allow_same_site) ---
+    def test_same_site_rejected_when_hardened(self):
+        from viur.core.config import conf
+        conf.security.fetch_metadata_allow_same_site = False
+        result = self._validate(
+            {"sec-fetch-site": "same-site", "sec-fetch-mode": "cors"}, is_post=True)
+        self.assertEqual(result[0], 403)
+
+    def test_same_site_hardened_still_allows_cors_allowlisted(self):
+        from viur.core.config import conf
+        conf.security.fetch_metadata_allow_same_site = False
+        conf.security.cors_origins = ["https://api.example.com"]
+        self.assertIsNone(self._validate({
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "cors",
+            "Origin": "https://api.example.com",
+        }, is_post=True))
+
+    def test_same_site_hardened_still_allows_navigation(self):
+        from viur.core.config import conf
+        conf.security.fetch_metadata_allow_same_site = False
+        self.assertIsNone(self._validate({
+            "sec-fetch-site": "same-site",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-dest": "document",
+        }))
