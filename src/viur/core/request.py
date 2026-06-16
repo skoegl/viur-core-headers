@@ -56,6 +56,35 @@ class RequestValidator(ABC):
         raise NotImplementedError()
 
 
+def _is_cors_allowed_origin(origin: str) -> bool:
+    """Whether ``origin`` is permitted by ``conf.security.cors_origins``.
+
+    Mirrors the allow-list semantics of :meth:`Router._cors`, so the Fetch-Metadata
+    gate below and the CORS layer agree on which cross-origin callers are trusted:
+
+    * ``cors_origins == "*"`` or a literal ``"*"`` entry -> any origin is allowed;
+    * a compiled :class:`re.Pattern` entry -> allowed if it ``match``-es the origin
+      (hence a ``re.compile(r".*")`` rule also allows everything);
+    * a plain ``str`` entry -> allowed on a case-insensitive exact match.
+    """
+    cors_origins = conf.security.cors_origins
+    if cors_origins == "*":
+        return True
+    for candidate in cors_origins:
+        if isinstance(candidate, re.Pattern):
+            if candidate.match(origin):
+                return True
+        elif isinstance(candidate, str):
+            if candidate == "*" or candidate.lower() == origin.lower():
+                return True
+        else:
+            raise TypeError(
+                f"Invalid conf.security.cors_origins entry {candidate!r}; "
+                f"expected a string or a compiled regex."
+            )
+    return False
+
+
 class FetchMetaDataValidator(RequestValidator):
     """
         This validator examines the headers "Sec-Fetch-Site", "sec-fetch-mode" and "sec-fetch-dest" as
@@ -66,28 +95,64 @@ class FetchMetaDataValidator(RequestValidator):
     @staticmethod
     def validate(request: 'BrowseHandler') -> t.Optional[tuple[int, str, str]]:
         """
-            This validator examines the headers "sec-fetch-site",
-            "sec-fetch-mode" and "sec-fetch-dest" as recommended
-            by https://web.dev/fetch-metadata/
+            Resource-isolation gate based on the Fetch-Metadata request headers
+            ("Sec-Fetch-Site"/"-Mode"/"-Dest"), as recommended by
+            https://web.dev/articles/fetch-metadata.
+
+            This is *defense-in-depth*, not the primary CSRF protection (that is the
+            ``@skey`` decorator): clients that don't send Fetch-Metadata (curl,
+            server-to-server, old browsers) are intentionally let through, so this gate
+            can only ever *add* protection against Fetch-Metadata-aware browsers and must
+            never be relied upon as the sole guard.
+
+            Returns ``None`` to accept the request, or an (status, reason, body)-tuple
+            to reject it.
         """
         headers = request.request.headers
+        site = headers.get("sec-fetch-site")
 
-        match headers.get("sec-fetch-site"):
-            case None | "same-origin" | "none":
-                # A Request from our site, or browser didn't send "sec-fetch-site"
-                return None
-            case "same-site":
-                # We are accepting a request with same-site only in local dev mode
-                if conf.instance.is_dev_server:
-                    return None
-            case _:
-                # Incoming navigation GET request
-                if (
-                    not request.isPostRequest
-                    and headers.get("sec-fetch-mode") == "navigate"
-                    and headers.get('sec-fetch-dest') not in ("object", "embed")
-                ):
-                    return None
+        # Always-trusted values of Sec-Fetch-Site:
+        #   * None          -- the client did not send Fetch-Metadata at all (non-browser
+        #                       clients such as curl/SDKs, server-to-server calls, or old
+        #                       browsers). Rejecting these would break every API consumer;
+        #                       see the defense-in-depth note above.
+        #   * "same-origin" -- our own origin.
+        #   * "none"        -- user-initiated with no originating context (address bar,
+        #                       bookmark, ...).
+        #   * "same-site"   -- a *different* origin but on the *same registrable site*
+        #                       (sub-domains, www<->apex, a differing port or scheme).
+        #                       A cross-site attacker is by definition "cross-site", never
+        #                       "same-site", so rejecting same-site adds essentially no
+        #                       protection against the threat model this gate targets while
+        #                       breaking very common multi-(sub)domain deployments (e.g. an
+        #                       SPA on app.example.com calling api.example.com). web.dev's
+        #                       reference policy accepts it, and so do we. (Previously this
+        #                       was allowed on the local dev server only, which broke the
+        #                       same legitimate pattern in production.)
+        if site in (None, "same-origin", "none", "same-site"):
+            return None
+
+        # Cross-site, but an Origin the project explicitly allow-listed for CORS.
+        #
+        # This gate runs *before* routing, hence before Router._cors(). Without this
+        # carve-out it would 403 exactly the cross-origin requests -- and their OPTIONS
+        # pre-flights -- that ``conf.security.cors_origins`` is configured to permit, i.e.
+        # ViUR's own CORS feature would be unusable for cross-site callers while this
+        # validator is active. We consult the very same allow-list CORS uses, so a trusted
+        # cross-origin Origin passes the gate and the regular CORS handling applies.
+        if (origin := headers.get("Origin")) and _is_cors_allowed_origin(origin):
+            return None
+
+        # Any remaining cross-site request is accepted only if it is a simple top-level
+        # navigation, so users can still follow a link or redirect to us. Everything else
+        # (cross-site fetch/XHR from a non-allow-listed origin, cross-site form POSTs, and
+        # <object>/<embed> embeddings) is rejected.
+        if (
+            not request.isPostRequest
+            and headers.get("sec-fetch-mode") == "navigate"
+            and headers.get("sec-fetch-dest") not in ("object", "embed")
+        ):
+            return None
 
         return 403, "Forbidden", "Request rejected due to fetch metadata"
 
