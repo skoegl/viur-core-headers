@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import typing as t
@@ -16,7 +17,9 @@ class RecordBone(BaseBone):
     nested dictionaries or objects, by using a related skeleton class (the using parameter) to manage
     the internal structure of the data.
 
-    :param format: Optional string parameter to specify the format of the record bone.
+    :param format: Optional Python expression (evaluated by the frontend) describing how a record is
+        displayed. When omitted, it is generated from the ``using``-skeleton: a bone named ``name``,
+        ``title`` or ``titel`` is preferred, otherwise all visible bones are concatenated.
     :param indexed: Optional boolean parameter to indicate if the record bone is indexed.
         Defaults to False.
     :param using: A class that inherits from 'viur.core.skeleton.RelSkel' to be used with the
@@ -37,11 +40,31 @@ class RecordBone(BaseBone):
         if not issubclass(using, RelSkel):
             raise ValueError("RecordBone requires for valid using-parameter (subclass of viur.core.skeleton.RelSkel)")
 
+        if indexed:
+            raise NotImplementedError("A RecordBone must not be indexed")
+
         super().__init__(indexed=indexed, **kwargs)
         self.using = using
-        self.format = format
-        if not format or indexed:
-            raise NotImplementedError("A RecordBone must not be indexed and must have a format set")
+        self._format = format
+
+    @functools.cached_property
+    def format(self) -> str:
+        """Format-string for this record; generated from the ``using``-skeleton if not set explicitly."""
+        return self._format or self._generate_format()
+
+    def _generate_format(self) -> str:
+        """Generates a display format-string from the ``using``-skeleton.
+
+        Prefers a bone named ``name``, ``title`` or ``titel``; otherwise all visible bones
+        are concatenated.
+        """
+        bone_map = self.using.__boneMap__
+        for preferred in ("name", "title", "titel"):
+            if preferred in bone_map:
+                return f"$({preferred})"
+
+        names = [name for name, bone in bone_map.items() if bone.visible] or list(bone_map)
+        return " ".join(f"$({name})" for name in names)
 
     def singleValueUnserialize(self, val):
         """
