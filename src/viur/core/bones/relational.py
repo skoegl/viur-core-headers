@@ -36,14 +36,26 @@ class RelationalConsistency(enum.IntEnum):
 
 class RelationalUpdateLevel(enum.Enum):
     """
-    An enumeration representing the different update levels for the RelationalBone class.
+    Controls how eagerly a RelationalBone keeps the values it mirrors from the referenced entity
+    (its ``refKeys``) up to date — and therefore how much write/instance-hour cost editing a
+    referenced entity incurs. See the "Performance & cost" note on :class:`RelationalBone`.
     """
     Always = 0
-    """Always update the relational information, regardless of the context."""
+    """Keep the mirrored ``refKeys`` eagerly in sync (default). Editing the referenced entity queues a
+    deferred ``update_relations`` task that rewrites *every* referencing entity, so the cost scales with
+    the fan-in (number of referencing entities). Choose this when you filter/sort by the mirrored values
+    and staleness is unacceptable; consider routing the deferred fan-out off the frontend instances via
+    ``conf.tasks_target_service``."""
     OnRebuildSearchIndex = 1
-    """Update the relational information only when rebuilding the search index."""
+    """Do not propagate eagerly: when the referenced entity changes the mirrored values go stale and are
+    refreshed only on a ``rebuildSearchIndex`` (a batch/cron job) or when the referencing entity is
+    itself written. Cheaper than :attr:`Always`; choose this when a bounded staleness window is
+    acceptable and you run a periodic rebuild."""
     OnValueAssignment = 2
-    """Update the relational information only when a new value is assigned to the bone."""
+    """Snapshot semantics: the mirrored values are frozen when the relation is (re)assigned and are never
+    auto-refreshed (even ``rebuildSearchIndex`` skips them). Cheapest — no fan-out cost. Choose this for
+    point-in-time references (e.g. audit/history, order line items) or for stable references whose
+    mirrored bones rarely change."""
 
 
 class RelDict(t.TypedDict):
@@ -75,6 +87,13 @@ class RelationalBone(BaseBone):
 
     It is not recommended for cases where data is read less frequently than written, as there is no
     write-efficient method available yet.
+
+    **Performance & cost:** editing a *referenced* entity queues a deferred ``update_relations`` task
+    that rewrites every entity referencing it (for bones with ``updateLevel=RelationalUpdateLevel.Always``),
+    so write and App-Engine instance-hour cost scale with the fan-in. To control this: lower the
+    ``updateLevel`` (see :class:`RelationalUpdateLevel`) and keep ``refKeys`` minimal for relations that
+    don't need live relational filtering, and/or route the deferred work off the frontend instances via
+    ``conf.tasks_target_service``.
 
     :param kind: KindName of the referenced property.
     :param module: Name of the module which should be used to select entities of kind "kind". If not set,
