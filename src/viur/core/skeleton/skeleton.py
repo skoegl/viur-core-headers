@@ -665,7 +665,9 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
                 if bone.compute and bone.compute.interval.method in (ComputeMethod.Always, ComputeMethod.Lifetime)
                 and bone is not Skeleton.__dict__["shortkey"] and name not in change_list
             ]
-            if changed_bones and len(changed_bones) < 5:  # Only a few bones have changed, process these individually
+            # Only bones this write actually changed count towards the threshold: the computed ones above are added on
+            # every write and would otherwise turn the filtered update into the unfiltered one.
+            if changed_bones and len(change_list) < 5:  # Only a few bones have changed, process these individually
                 tasks.update_relations(key, changed_bones=changed_bones, _countdown=10)
 
             elif changed_bones:  # Update all inbound relations, regardless of which bones they mirror

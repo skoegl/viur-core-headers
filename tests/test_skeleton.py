@@ -354,3 +354,37 @@ class TestWriteUpdatesRelationsOutsideTheComparison(_WriteWithFakeDb):
                     self._add(skel_cls, label="same")
                     self._edit(skel_cls, **values)
                     self.update_relations.assert_called_once_with(self.key, changed_bones=changed, _countdown=10)
+
+
+_many_always_skel = []
+
+
+def _many_always_skel_cls():
+    """A skeleton with four bones computed ``Always`` (besides the inherited ``shortkey``) and a plain ``label``."""
+    if not _many_always_skel:
+        from viur.core import conf, skeleton
+        from viur.core.bones import Compute, ComputeInterval, ComputeMethod, RawBone, StringBone
+
+        def always():
+            return RawBone(compute=Compute(lambda skel: "constant", ComputeInterval(ComputeMethod.Always)))
+
+        with mock.patch.object(conf, "skeleton_search_path", [*conf.skeleton_search_path, "/"]):
+            class ManyAlwaysSkel(skeleton.Skeleton):
+                kindName = "test-many-always"
+                label = StringBone()
+                c1, c2, c3, c4 = always(), always(), always(), always()
+
+        _many_always_skel.append(ManyAlwaysSkel)
+    return _many_always_skel[0]
+
+
+class TestWriteWithManyComputedBones(_WriteWithFakeDb):
+    """Bones computed ``Always`` count as changed on every write. They must not count towards the threshold of five
+    that switches to the unfiltered update, which refreshes every referencing entity regardless of what it mirrors."""
+
+    def test_one_changed_bone_keeps_the_filtered_update(self):
+        skel_cls = _many_always_skel_cls()
+        self._add(skel_cls, label="old")
+        self._edit(skel_cls, label="new")
+        args, kwargs = self.update_relations.call_args
+        self.assertIn("changed_bones", kwargs, "one changed bone queued the unfiltered update_relations")
