@@ -388,3 +388,24 @@ class TestWriteWithManyComputedBones(_WriteWithFakeDb):
         self._edit(skel_cls, label="new")
         args, kwargs = self.update_relations.call_args
         self.assertIn("changed_bones", kwargs, "one changed bone queued the unfiltered update_relations")
+
+
+class TestWriteBeyondTheInFilterLimit(_WriteWithFakeDb):
+    """The filtered ``update_relations`` queries ``viur_foreign_keys IN changed_bones``, and the datastore accepts at
+    most 30 values there. Beyond that the task would fail on every attempt and nothing would be refreshed."""
+
+    def test_more_than_30_changed_bones_queue_the_unfiltered_update(self):
+        from viur.core import conf, skeleton
+        from viur.core.bones import Compute, ComputeInterval, ComputeMethod, RawBone, StringBone
+
+        with mock.patch.object(conf, "skeleton_search_path", [*conf.skeleton_search_path, "/"]):
+            class ThirtyAlwaysSkel(skeleton.Skeleton):
+                kindName = "test-thirty-always"
+                label = StringBone()
+                for _i in range(30):
+                    vars()[f"c{_i}"] = RawBone(
+                        compute=Compute(lambda skel: "constant", ComputeInterval(ComputeMethod.Always)))
+
+        self._add(ThirtyAlwaysSkel, label="old")
+        self._edit(ThirtyAlwaysSkel, label="new")  # changedate, label and 30 computed bones: 32 values
+        self.update_relations.assert_called_once_with(self.key, _countdown=10)

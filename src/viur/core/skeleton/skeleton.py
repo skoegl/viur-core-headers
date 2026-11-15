@@ -667,7 +667,8 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
             ]
             # Only bones this write actually changed count towards the threshold: the computed ones above are added on
             # every write and would otherwise turn the filtered update into the unfiltered one.
-            if changed_bones and len(change_list) < 5:  # Only a few bones have changed, process these individually
+            # The filtered task queries viur_foreign_keys IN changed_bones, which the datastore limits to 30 values.
+            if changed_bones and len(change_list) < 5 and len(changed_bones) <= 30:  # Only a few bones have changed
                 tasks.update_relations(key, changed_bones=changed_bones, _countdown=10)
 
             elif changed_bones:  # Update all inbound relations, regardless of which bones they mirror
