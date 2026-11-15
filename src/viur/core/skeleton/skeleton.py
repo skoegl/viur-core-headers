@@ -603,6 +603,27 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
                             if isinstance(x, dict):
                                 fixDotNames(x)
 
+            pending = None
+            if update_relations and not is_add:
+                # Entities referencing this one mirror nothing but bone values. A bone computed on read (Always) or
+                # storing its recomputed value while reading (Lifetime) may have moved without this write seeing it,
+                # so it always counts as changed; with nothing changed at all there is nothing to update. The
+                # exception is the shortkey of this class, computed Always but from the key alone, which no write
+                # changes: every relation mirrors it, so counting it would refresh every referencing entity on every
+                # write.
+                changed_bones = change_list + [
+                    name for name, bone in skel.skeletonCls.__boneMap__.items()
+                    if bone.compute and bone.compute.interval.method in (ComputeMethod.Always, ComputeMethod.Lifetime)
+                    and bone is not Skeleton.__dict__["shortkey"] and name not in change_list
+                ]
+                # Only bones this write actually changed count towards the threshold of five: the computed ones are
+                # added on every write and would otherwise turn the filtered update into the unfiltered one, which
+                # refreshes all inbound relations regardless of which bones they mirror. The filtered task queries
+                # viur_foreign_keys IN changed_bones, which the datastore limits to 30 values.
+                if changed_bones:
+                    filtered = len(change_list) < 5 and len(changed_bones) <= 30
+                    pending = tasks.pending_marker(db_key, changed_bones if filtered else None)
+
             if skip_unchanged and not is_add and set(change_list) <= {"changedate"} | {
                 name for name, bone in skel.items()
                 if bone.compute and bone.compute.interval.method == ComputeMethod.Always
@@ -610,7 +631,7 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
                 # Nothing but the date of this write would change, and bones computed on every read, whose stored
                 # value nobody relies on (the inherited shortkey is stored by the first write that reads it):
                 # leave the entity, its blob lock and its viur-relations entries as they are.
-                return skel.dbEntity.key, write_skel, None, is_add
+                return skel.dbEntity.key, write_skel, None, is_add, None
 
             # FIXME: REMOVE IN VIUR4
             if conf.viur2import_blobsource:  # Try to fix these only when converting from ViUR2
@@ -618,6 +639,9 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
 
             # Write the core entry back
             db.put(skel.dbEntity)
+
+            if pending is not None:
+                db.put(pending)  # in this transaction: the entity is never written without it
 
             # Now write the blob-lock object
             blob_list = skel.preProcessBlobLocks(blob_list)
@@ -650,7 +674,7 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
                 blob_lock_obj["is_stale"] = False
                 db.put(blob_lock_obj)
 
-            return skel.dbEntity.key, write_skel, change_list, is_add
+            return skel.dbEntity.key, write_skel, change_list, is_add, pending
 
         # Parse provided key, if any, and set it to skel["key"]
         if key:
@@ -665,9 +689,9 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
 
         # Run transactional function
         if db.is_in_transaction():
-            key, skel, change_list, is_add = __txn_write(skel)
+            key, skel, change_list, is_add, pending = __txn_write(skel)
         else:
-            key, skel, change_list, is_add = db.run_in_transaction(__txn_write, skel)
+            key, skel, change_list, is_add, pending = db.run_in_transaction(__txn_write, skel)
 
         if change_list is None:  # skip_unchanged: nothing was written
             return skel
@@ -677,27 +701,16 @@ class Skeleton(BaseSkeleton, metaclass=MetaSkel):
 
         skel.postSavedHandler(key, skel.dbEntity)
 
-        if update_relations and not is_add:
-            # Entities referencing this one mirror nothing but bone values. A bone computed on read (Always) or
-            # storing its recomputed value while reading (Lifetime) may have moved without this write seeing it, so
-            # it always counts as changed; with nothing changed at all there is nothing to update. The exception is
-            # the shortkey of this class, computed Always but from the key alone, which no write changes: every
-            # relation mirrors it, so counting it would refresh every referencing entity on every write.
-            changed_bones = change_list + [
-                name for name, bone in skel.skeletonCls.__boneMap__.items()
-                if bone.compute and bone.compute.interval.method in (ComputeMethod.Always, ComputeMethod.Lifetime)
-                and bone is not Skeleton.__dict__["shortkey"] and name not in change_list
-            ]
-            # Only bones this write actually changed count towards the threshold: the computed ones above are added on
-            # every write and would otherwise turn the filtered update into the unfiltered one.
-            # The filtered task queries viur_foreign_keys IN changed_bones, which the datastore limits to 30 values.
-            if changed_bones and len(change_list) < 5 and len(changed_bones) <= 30:  # Only a few bones have changed
-                tasks.update_relations(key, changed_bones=changed_bones, _countdown=10)
-
-            elif changed_bones:  # Update all inbound relations, regardless of which bones they mirror
-                # The same delay as above: the task visits relations written before it starts, so a source write
-                # still in flight with the old values of this entry is caught as long as it lands within it.
-                tasks.update_relations(key, _countdown=10)
+        if pending is not None:
+            # Queue the update of the entities referencing this one. Its marker is already stored with the entity: if
+            # the task cannot be created now, tasks.requeue_pending_relation_updates() does it later, so this must
+            # not fail a write that is committed.
+            try:
+                tasks.update_relations(
+                    key, **({"changed_bones": pending["changed_bones"]} if pending["changed_bones"] else {}),
+                    _countdown=10, pending=pending.key.id_or_name)
+            except Exception:
+                logging.exception(f"Could not queue update_relations for {key!r}, it will be queued again by cron")
 
         # Trigger the database adapter of the changes made to the entry
         for adapter in skel.database_adapters:

@@ -153,3 +153,73 @@ class TestUpdateRelationsVisitsEachRelationOnce(ViURTestCase):
             update_relations(FakeKey("dest"), changed_bones=["name"], _call_deferred=False)
 
         self.assertEqual(["src-0", "src-1", "src-2"], refreshed)
+
+
+class TestPendingRelationUpdates(ViURTestCase):
+    """The marker written by ``Skeleton.write`` lives until its task chain is done; what is left is queued again."""
+
+    def _run(self, next_cursor, marker):
+        from viur.core.skeleton import tasks
+
+        query = mock.MagicMock()
+        query.run.return_value = []
+        query.getCursor.return_value = next_cursor
+        query.filter.return_value = query
+        run = tasks.update_relations  # the next page is queued through the module attribute, replaced below
+        with mock.patch.object(tasks.db, "Query", return_value=query), \
+                mock.patch.object(tasks.db, "get", return_value=marker), \
+                mock.patch.object(tasks.db, "put") as put, \
+                mock.patch.object(tasks.db, "delete") as delete, \
+                mock.patch.object(tasks.current, "request_data", mock.MagicMock()), \
+                mock.patch.object(tasks, "update_relations") as self.next_page:
+            run(FakeKey("variant"), changed_bones=["name"], pending="marker-1", _call_deferred=False)
+        return put, delete
+
+    def test_finished_chain_deletes_its_marker(self):
+        put, delete = self._run(None, {"queued": 1.0})
+        delete.assert_called_once()
+        self.assertEqual(delete.call_args.args[0].id_or_name, "marker-1")
+        self.next_page.assert_not_called()
+
+    def test_running_chain_keeps_the_marker_alive_and_passes_it_on(self):
+        marker = {"queued": 1.0}
+        put, delete = self._run("cursor-2", marker)
+        delete.assert_not_called()
+        put.assert_called_once_with(marker)
+        self.assertGreater(marker["queued"], 1.0)
+        self.assertEqual(self.next_page.call_args.kwargs["pending"], "marker-1")
+        self.assertEqual(self.next_page.call_args.kwargs["cursor"], "cursor-2")
+
+    def _sweep(self, markers):
+        from viur.core.skeleton import tasks
+
+        query = mock.MagicMock()
+        query.filter.return_value = query
+        query.iter.return_value = markers
+        with mock.patch.object(tasks.db, "Query", return_value=query), \
+                mock.patch.object(tasks.db, "put") as put, \
+                mock.patch.object(tasks, "update_relations") as queue:
+            tasks.requeue_pending_relation_updates()
+        return put, queue
+
+    def _marker(self, attempts):
+        marker = type("Marker", (dict,), {})(
+            target=FakeKey("variant"), changed_bones=["name"], attempts=attempts, queued=1.0, created=1.0)
+        marker.key = mock.Mock(id_or_name="marker-1")
+        return marker
+
+    def test_left_marker_is_queued_again(self):
+        marker = self._marker(attempts=0)
+        put, queue = self._sweep([marker])
+        queue.assert_called_once_with(FakeKey("variant"), changed_bones=["name"], pending="marker-1")
+        self.assertEqual(marker["attempts"], 1)
+        self.assertGreater(marker["queued"], 1.0)
+        put.assert_called_once_with(marker)
+
+    def test_marker_that_keeps_failing_is_reported_and_not_queued(self):
+        from viur.core.skeleton import tasks
+        marker = self._marker(attempts=tasks.PENDING_MAX_ATTEMPTS)
+        with self.assertLogs(level="CRITICAL") as logs:
+            put, queue = self._sweep([marker])
+        queue.assert_not_called()
+        self.assertIn("variant", logs.output[0])
