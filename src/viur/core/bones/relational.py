@@ -8,6 +8,7 @@ import logging
 import time
 import typing as t
 import warnings
+import weakref
 from itertools import chain
 
 from viur.core import db, i18n, utils
@@ -49,6 +50,22 @@ class RelationalUpdateLevel(enum.Enum):
 class RelDict(t.TypedDict):
     dest: "SkeletonInstance"
     rel: t.Optional["RelSkel"]
+
+
+_targets_by_transaction: weakref.WeakKeyDictionary[t.Any, dict[db.Key, db.Entity]] = weakref.WeakKeyDictionary()
+
+
+def _transaction_targets() -> dict[db.Key, db.Entity] | None:
+    """
+    The entities :meth:`RelationalBone.refresh` read in the running transaction, by key; ``None`` outside of one.
+
+    A transaction reads an entity as it was when the transaction began, however often it asks, so what one read
+    gave holds until the transaction ends. Kept per transaction object: nothing outlives it.
+    """
+    if (transaction := db.transport.__client__.current_transaction) is None:
+        return None
+
+    return _targets_by_transaction.setdefault(transaction, {})
 
 
 class RelationalBone(BaseBone):
@@ -1110,6 +1127,9 @@ class RelationalBone(BaseBone):
 
                     continue
 
+                if (targets := _transaction_targets()) is not None:
+                    targets[target_skel["key"]] = target_skel.dbEntity  # refresh_copies() needs no second read
+
                 # Reset the dbEntity for a clean rewrite
                 value["dest"].dbEntity = None
 
@@ -1133,16 +1153,23 @@ class RelationalBone(BaseBone):
         before is read here, one committed meanwhile conflicts with the transaction, and one committed later is
         refreshed by its own ``update_relations``.
 
-        All targets are read with one ``db.get``. A target that no longer exists is left as it is: handling it is up
-        to :meth:`refresh` and the consistency of the relation. Copies with an ``updateLevel`` other than ``Always``
-        are frozen on purpose and stay untouched; relations inside a ``using`` skeleton are refreshed as well.
+        All targets are read with one ``db.get``, except those :meth:`refresh` read in the same transaction
+        (``update_relations`` refreshes and writes in one). A target that no longer exists is left as it is:
+        handling it is up to :meth:`refresh` and the consistency of the relation. Copies with an ``updateLevel`` other
+        than ``Always`` are frozen on purpose and stay untouched; relations inside a ``using`` skeleton are refreshed
+        as well.
         """
         from viur.core.skeleton import skeletonByKind
 
         values = [value for _, _, value in self.iter_bone_value(skel, name) if value and value["dest"]]
 
         if values and self.updateLevel == RelationalUpdateLevel.Always:
-            targets = {entity.key: entity for entity in db.get(list({value["dest"]["key"] for value in values}))}
+            keys = {value["dest"]["key"] for value in values}
+            known = _transaction_targets() or {}  # what refresh() read in this transaction
+            targets = {key: known[key] for key in keys if key in known}
+
+            if missing := list(keys - targets.keys()):
+                targets |= {entity.key: entity for entity in db.get(missing)}
 
             for value in values:
                 if (entity := targets.get(value["dest"]["key"])) is None:

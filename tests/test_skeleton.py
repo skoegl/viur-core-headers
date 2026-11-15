@@ -492,6 +492,55 @@ class TestWriteRefreshesRelationCopies(_WriteWithFakeDb):
         self.assertEqual(bone.calls, [])
         self.assertEqual(self._stored(key)["rel_extra"]["dest"]["name"], "new")  # the copy itself is refreshed
 
+    def _transaction(self):
+        """Lets the datastore client report a running transaction, as inside ``db.run_in_transaction``."""
+        from google.cloud import datastore
+
+        class Transaction:
+            pass
+
+        return mock.patch.object(
+            datastore.Client, "current_transaction", new_callable=mock.PropertyMock, return_value=Transaction())
+
+    def _target_reads(self):
+        from viur.core import db
+        return sum(
+            self.target_key in (keys if isinstance(keys, list) else [keys]) for (keys,), _ in db.get.call_args_list)
+
+    def test_targets_read_by_refresh_are_not_read_again_in_the_same_transaction(self):
+        from viur.core import db
+        key = self._source_with_copies_of().write()["key"]
+        self._rename_target("new")
+        skel = self.source_cls()
+        with self._transaction():  # what update_relations does: patch() reads, refreshes and writes in one
+            skel.read(key)
+            db.get.reset_mock()
+            skel.refresh()
+            refreshed = self._target_reads()
+            skel.write()
+        self.assertEqual(self._target_reads(), refreshed)
+        self.assertEqual(self._stored(key)["rel"]["dest"]["name"], "new")
+
+    def test_targets_read_by_refresh_are_read_again_in_another_transaction(self):
+        key = self._source_with_copies_of().write()["key"]
+        skel = self.source_cls()
+        with self._transaction():
+            skel.read(key)
+            skel.refresh()
+        self._rename_target("new")  # committed after the refresh, before the write below
+        with self._transaction():
+            skel.write()
+        self.assertEqual(self._stored(key)["rel"]["dest"]["name"], "new")
+
+    def test_targets_read_by_refresh_are_read_again_without_a_transaction(self):
+        key = self._source_with_copies_of().write()["key"]
+        skel = self.source_cls()
+        skel.read(key)
+        skel.refresh()
+        self._rename_target("new")
+        skel.write()
+        self.assertEqual(self._stored(key)["rel"]["dest"]["name"], "new")
+
 
 class TestWriteBeyondTheInFilterLimit(_WriteWithFakeDb):
     """The filtered ``update_relations`` queries ``viur_foreign_keys IN changed_bones``, and the datastore accepts at
