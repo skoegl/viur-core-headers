@@ -252,6 +252,10 @@ class _WriteWithFakeDb(ViURTestCase):
             for entity in entities if isinstance(entities, list) else [entities]:
                 self.docs[(entity.key.kind, entity.key.id_or_name)] = copy.deepcopy(entity)
 
+        def delete(keys):
+            for key in keys if isinstance(keys, list) else [keys]:
+                self.docs.pop((key.kind, key.id_or_name), None)
+
         def allocate_ids(kind):
             return [db.Key(kind, "test-entry")]
 
@@ -260,6 +264,7 @@ class _WriteWithFakeDb(ViURTestCase):
         for patcher in (
             mock.patch.object(db, "get", side_effect=get),
             mock.patch.object(db, "put", side_effect=put),
+            mock.patch.object(db, "delete", side_effect=delete),
             mock.patch.object(db, "allocate_ids", side_effect=allocate_ids),
             mock.patch.object(db, "is_in_transaction", return_value=True),
             mock.patch.object(tasks, "update_relations", self.update_relations),
@@ -301,12 +306,14 @@ class TestWriteUpdatesRelationsOnChange(_WriteWithFakeDb):
 
     def test_a_changed_bone_queues_its_update(self):
         self._edit(self.skel_cls, default_text="new")
-        self.update_relations.assert_called_once_with(self.key, changed_bones=["default_text"], _countdown=10)
+        self.update_relations.assert_called_once_with(
+            self.key, changed_bones=["default_text"], _countdown=10, pending=mock.ANY
+        )
 
     def test_many_changed_bones_queue_the_full_update_after_the_same_delay(self):
         self._edit(self.skel_cls, default_text="new", hint="h", usage_filename="f.py", usage_lineno=1,
                    usage_variables=["v"])
-        self.update_relations.assert_called_once_with(self.key, _countdown=10)
+        self.update_relations.assert_called_once_with(self.key, _countdown=10, pending=mock.ANY)
 
     def test_a_changed_seo_key_queues_its_update(self):
         """``SeoKeyBone`` stores into ``viur.viurCurrentSeoKeys``, which the comparison per bone field missed."""
@@ -315,7 +322,7 @@ class TestWriteUpdatesRelationsOnChange(_WriteWithFakeDb):
         stored[language] = "a-key-the-write-replaces"
         self._edit(self.skel_cls)
         self.update_relations.assert_called_once_with(
-            self.key, changed_bones=["viurCurrentSeoKeys"], _countdown=10)
+            self.key, changed_bones=["viurCurrentSeoKeys"], _countdown=10, pending=mock.ANY)
 
 
 class TestWriteUpdatesRelationsOutsideTheComparison(_WriteWithFakeDb):
@@ -330,12 +337,16 @@ class TestWriteUpdatesRelationsOutsideTheComparison(_WriteWithFakeDb):
 
     def test_a_field_changed_by_a_hook_queues_its_update(self):
         self._hooked_edit(lambda entity: entity.update(label="hooked"), label="old")
-        self.update_relations.assert_called_once_with(self.key, changed_bones=["label"], _countdown=10)
+        self.update_relations.assert_called_once_with(
+            self.key, changed_bones=["label"], _countdown=10, pending=mock.ANY
+        )
 
     def test_a_nested_value_changed_in_place_by_a_hook_queues_its_update(self):
         """``payload`` is not written by this edit; the hook changes its stored dict in place."""
         self._hooked_edit(lambda entity: entity["payload"].update(x="new"), payload={"x": "old"})
-        self.update_relations.assert_called_once_with(self.key, changed_bones=["payload"], _countdown=10)
+        self.update_relations.assert_called_once_with(
+            self.key, changed_bones=["payload"], _countdown=10, pending=mock.ANY
+        )
 
     def test_only_the_shortkey_of_skeleton_is_exempt(self):
         """The base ``shortkey`` is computed from the key alone and every relation mirrors it, so it does not count
@@ -343,7 +354,9 @@ class TestWriteUpdatesRelationsOutsideTheComparison(_WriteWithFakeDb):
         skel_cls = _shortkey_override_skel()
         self._add(skel_cls, label="same")
         self._edit(skel_cls)
-        self.update_relations.assert_called_once_with(self.key, changed_bones=["shortkey"], _countdown=10)
+        self.update_relations.assert_called_once_with(
+            self.key, changed_bones=["shortkey"], _countdown=10, pending=mock.ANY
+        )
 
     def test_a_bone_computed_on_read_always_counts_as_changed(self):
         """``Lifetime`` stores a recomputed value while reading and ``Always`` computes on every read: a write cannot
@@ -355,7 +368,9 @@ class TestWriteUpdatesRelationsOutsideTheComparison(_WriteWithFakeDb):
                     self.update_relations.reset_mock()
                     self._add(skel_cls, label="same")
                     self._edit(skel_cls, **values)
-                    self.update_relations.assert_called_once_with(self.key, changed_bones=changed, _countdown=10)
+                    self.update_relations.assert_called_once_with(
+                        self.key, changed_bones=changed, _countdown=10, pending=mock.ANY
+                    )
 
 
 _many_always_skel = []
@@ -496,7 +511,7 @@ class TestWriteBeyondTheInFilterLimit(_WriteWithFakeDb):
 
         self._add(ThirtyAlwaysSkel, label="old")
         self._edit(ThirtyAlwaysSkel, label="new")  # changedate, label and 30 computed bones: 32 values
-        self.update_relations.assert_called_once_with(self.key, _countdown=10)
+        self.update_relations.assert_called_once_with(self.key, _countdown=10, pending=mock.ANY)
 
 
 _matrix_skels = []
@@ -701,3 +716,44 @@ class TestRefreshWritesOnlyWhatChanged(_WriteWithFakeDb):
     def test_default_still_writes(self):
         self._refresh()
         self.db.put.assert_called()
+
+
+class TestWriteRecordsPendingRelationUpdates(_WriteWithFakeDb):
+    """The datastore and Cloud Tasks share no transaction: a write can commit and the creation of its
+    ``update_relations`` task fail, and nothing would ever refresh the referencing entities. ``write`` therefore stores
+    a marker in its transaction; the task deletes it when it is done, and a cron task queues what is left again."""
+
+    def setUp(self):
+        super().setUp()
+        self.skel_cls = _translation_skel()
+        self._add(self.skel_cls, name="some.key", default_text="old")
+
+    def _markers(self):
+        return [entity for (kind, _), entity in self.docs.items() if kind == "viur-relations-pending"]
+
+    def test_edit_stores_a_marker_and_hands_it_to_the_task(self):
+        self._edit(self.skel_cls, default_text="new")
+        (marker,) = self._markers()
+        self.assertEqual(marker["target"], self.key)
+        self.assertEqual(marker["changed_bones"], ["default_text"])
+        self.assertEqual(marker["attempts"], 0)
+        self.update_relations.assert_called_once_with(
+            self.key, changed_bones=["default_text"], _countdown=10, pending=marker.key.id_or_name)
+
+    def test_unchanged_write_stores_no_marker(self):
+        self._edit(self.skel_cls)
+        self.assertEqual(self._markers(), [])
+
+    def test_write_without_update_relations_stores_no_marker(self):
+        skel = self.skel_cls()
+        self.assertTrue(skel.read(self.key))
+        skel["default_text"] = "new"
+        skel.write(update_relations=False)
+        self.assertEqual(self._markers(), [])
+
+    def test_failing_task_creation_keeps_the_write_and_the_marker(self):
+        self.update_relations.side_effect = RuntimeError("503 recvmsg: Connection reset by peer")
+        with self.assertLogs(level="ERROR"):
+            self._edit(self.skel_cls, default_text="new")  # must not raise: the entity is written
+        self.assertEqual(self.docs[(self.key.kind, self.key.id_or_name)]["default_text"], "new")
+        self.assertEqual(len(self._markers()), 1)

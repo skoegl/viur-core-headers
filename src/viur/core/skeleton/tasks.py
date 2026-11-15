@@ -1,7 +1,9 @@
+import datetime
 import logging
 import typing as t
 import logics
 import time
+import uuid
 
 from viur.core import (
     conf,
@@ -22,6 +24,59 @@ from ..bones.select import SelectBone
 from ..bones.string import StringBone
 
 
+PENDING_KIND = "viur-relations-pending"
+"""Kind of the markers for update_relations chains that are not done yet, see :func:`pending_marker`."""
+
+PENDING_STALE_AFTER = 15 * 60
+"""Seconds without a sign of life after which a marker's chain is considered lost and queued again."""
+
+PENDING_MAX_ATTEMPTS = 5
+"""How often a lost chain is queued again before it is reported instead."""
+
+
+def pending_marker(key: db.Key, changed_bones: t.Optional[list[str]]) -> db.Entity:
+    """
+        A marker for the ``update_relations`` of ``key`` that still has to run.
+
+        The datastore and Cloud Tasks share no transaction: a write can commit and the creation of its task fail, or
+        the task can run out of attempts, and no entity referencing ``key`` would ever be refreshed.
+        :meth:`viur.core.skeleton.Skeleton.write` therefore puts this marker inside its transaction. The task chain
+        keeps it alive while it runs and deletes it when it is done; :func:`requeue_pending_relation_updates` queues
+        what is left again.
+    """
+    now = time.time()
+    marker = db.Entity(db.Key(PENDING_KIND, uuid.uuid4().hex))
+    marker["target"] = key
+    marker["changed_bones"] = changed_bones
+    marker["created"] = marker["queued"] = now
+    marker["attempts"] = 0
+    return marker
+
+
+@tasks.PeriodicTask(interval=datetime.timedelta(minutes=10))
+def requeue_pending_relation_updates() -> None:
+    """
+        Queues every ``update_relations`` again whose marker shows no sign of life, see :func:`pending_marker`.
+
+        A chain that was lost :data:`PENDING_MAX_ATTEMPTS` times is not queued again but reported with a critical
+        log message on every run, until someone resolves it (and deletes the marker).
+    """
+    now = time.time()
+    for marker in db.Query(PENDING_KIND).filter("queued <", now - PENDING_STALE_AFTER).iter():
+        if marker["attempts"] >= PENDING_MAX_ATTEMPTS:
+            logging.critical(
+                f"""update_relations for {marker["target"]!r} failed {marker["attempts"]} times and is not """
+                f"""queued again; entities referencing it may hold outdated values ({marker.key!r})"""
+            )
+            continue
+
+        marker["attempts"] += 1
+        marker["queued"] = now
+        db.put(marker)
+        logging.warning(f"""Queueing lost update_relations for {marker["target"]!r} again ({marker["attempts"]=})""")
+        update_relations(marker["target"], changed_bones=marker["changed_bones"], pending=marker.key.id_or_name)
+
+
 @tasks.CallDeferred
 def update_relations(
     key: db.Key,
@@ -30,6 +85,7 @@ def update_relations(
     changed_bones: t.Optional[t.Iterable[str] | str] = (),
     cursor: t.Optional[str] = None,
     total: int = 0,
+    pending: t.Optional[str] = None,
     **kwargs
 ):
     """
@@ -48,6 +104,7 @@ def update_relations(
             key and name by default, so we don't have to update these if only another bone has been changed.
         :param cursor: The database cursor for the current request as we only process five entities at once and then
             defer again.
+        :param pending: Name of the marker of this chain, see :func:`pending_marker`.
     """
     # TODO: Remove in VIUR4
     for _dep, _new in {
@@ -111,14 +168,22 @@ def update_relations(
         total += 1
 
     if next_cursor := query.getCursor():
+        if pending and (marker := db.get(db.Key(PENDING_KIND, pending))):
+            marker["queued"] = time.time()  # a sign of life: this chain is running
+            db.put(marker)
+
         update_relations(
             key=key,
             min_change_time=min_change_time,
             changed_bones=changed_bones,
             cursor=next_cursor,
-            total=total
+            total=total,
+            pending=pending,
         )
     else:
+        if pending:
+            db.delete(db.Key(PENDING_KIND, pending))
+
         logging.debug(f"update_relations finished with {total=} on {key=} {min_change_time=} {changed_bones=}")
 
 
