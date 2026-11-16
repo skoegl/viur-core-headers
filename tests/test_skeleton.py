@@ -717,6 +717,52 @@ class TestWriteRefreshesEveryShapeOfRelation(_RelationMatrix):
             self.assertEqual(stored[name]["dest"]["name"], "old", name)
 
 
+class TestRefreshReadsTargetsInOneBatch(_RelationMatrix):
+    """``refresh`` reads the targets of a relation with one ``db.get`` instead of one per target, and handles a target
+    that is gone as before."""
+
+    def _stored_source(self, *names):
+        skel = self.source_cls()
+        for name in names:
+            self.assertTrue(skel.setBoneValue(name, self.target_key), name)
+        key = skel.write()["key"]
+        skel = self.source_cls()
+        self.assertTrue(skel.read(key))
+        return skel
+
+    def test_all_targets_of_a_relation_are_read_with_one_get(self):
+        from viur.core import db
+        second_key = db.Key(self.target_cls.kindName, "second")
+        second = self.target_cls()
+        second["key"], second["name"] = second_key, "old"
+        second.write()
+        skel = self.source_cls()
+        for key in (self.target_key, second_key, self.target_key):  # one of them twice
+            self.assertTrue(skel.setBoneValue("multi", key, append=True))
+        key = skel.write()["key"]
+        skel = self.source_cls()
+        self.assertTrue(skel.read(key))
+        for target in (self.target_key, second_key):
+            self.docs[(target.kind, target.id_or_name)]["name"] = "new"
+        db.get.reset_mock()
+        self.source_cls.multi.refresh(skel, "multi")
+        (keys,), _ = db.get.call_args
+        self.assertEqual(db.get.call_count, 1)
+        self.assertCountEqual(keys, [self.target_key, second_key])
+        self.assertEqual([value["dest"]["name"] for value in skel["multi"]], ["new", "new", "new"])
+
+    def test_deleted_target_is_handled_by_the_consistency_of_the_relation(self):
+        skel = self._stored_source("single", "cascade", "set_null")
+        del self.docs[(self.target_key.kind, self.target_key.id_or_name)]
+        for name in ("single", "set_null"):
+            getattr(self.source_cls, name).refresh(skel, name)
+        self.assertEqual(skel["single"]["dest"]["name"], "old")  # kept, as the default consistency says
+        self.assertFalse(skel["set_null"])
+        self.assertFalse(getattr(skel, "_cascade_deletion", False))
+        self.source_cls.cascade.refresh(skel, "cascade")
+        self.assertTrue(skel._cascade_deletion)
+
+
 class TestRefreshWritesOnlyWhatChanged(_WriteWithFakeDb):
     """``update_relations`` refreshes every entity that references the changed one. Two chains running at once, or a
     source that was written with current values meanwhile, find nothing to change: such an entity must not be written

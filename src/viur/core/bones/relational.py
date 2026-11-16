@@ -1087,60 +1087,70 @@ class RelationalBone(BaseBone):
         correspond to other entities. It fetches the updated values for the relational bone's
         reference keys and replaces the cached values in the skeleton with the fetched values.
 
+        All targets of the bone are read with one ``db.get``. A target that no longer exists is handled as the
+        ``consistency`` of the relation says.
+
         :param SkeletonInstance skel: The skeleton containing the bone to be refreshed.
         :param str boneName: The name of the bone to be refreshed.
         """
         if not skel[name] or self.updateLevel == RelationalUpdateLevel.OnValueAssignment:
             return
 
-        for _, _, value in self.iter_bone_value(skel, name):
-            if value and value["dest"]:
-                try:
-                    target_skel = value["dest"].read()
-                except ValueError:
+        from viur.core.skeleton import skeletonByKind
 
-                    # Handle removed reference according to the RelationalConsistency settings
-                    match self.consistency:
-                        case RelationalConsistency.CascadeDeletion:
-                            logging.info(
-                                f"{name}: "
-                                f"Cascade deleting {skel["key"]!r} ({skel["name"]!r}) "
-                                f"due removal of relation {value["dest"]["key"]!r} ({value["dest"]["name"]!r})"
-                            )
-                            skel._cascade_deletion = True
-                            break
+        values = [value for _, _, value in self.iter_bone_value(skel, name) if value and value["dest"]]
 
-                        case RelationalConsistency.SetNull:
-                            logging.info(
-                                f"{name}: "
-                                f"Emptying relation {skel["key"]!r} ({skel["name"]!r}) "
-                                f"due removal of {value["dest"]["key"]!r} ({value["dest"]["name"]!r})"
-                            )
-                            value.clear()
+        # One read for all targets instead of one per target
+        entities = {entity.key: entity for entity in db.get(list({value["dest"]["key"] for value in values}))}
 
-                        case _:
-                            logging.info(
-                                f"{name}: "
-                                f"Relation from {skel["key"]!r} ({skel["name"]!r}) "
-                                f"refers to deleted {value["dest"]["key"]!r} ({value["dest"]["name"]!r}), skipping"
-                            )
+        if (targets := _transaction_targets()) is not None:
+            targets |= entities  # refresh_copies() needs no second read
 
-                    continue
+        for value in values:
+            if (entity := entities.get(value["dest"]["key"])) is None:
 
-                if (targets := _transaction_targets()) is not None:
-                    targets[target_skel["key"]] = target_skel.dbEntity  # refresh_copies() needs no second read
+                # Handle removed reference according to the RelationalConsistency settings
+                match self.consistency:
+                    case RelationalConsistency.CascadeDeletion:
+                        logging.info(
+                            f"{name}: "
+                            f"Cascade deleting {skel["key"]!r} ({skel["name"]!r}) "
+                            f"due removal of relation {value["dest"]["key"]!r} ({value["dest"]["name"]!r})"
+                        )
+                        skel._cascade_deletion = True
+                        break
 
-                # Reset the dbEntity for a clean rewrite
-                value["dest"].dbEntity = None
+                    case RelationalConsistency.SetNull:
+                        logging.info(
+                            f"{name}: "
+                            f"Emptying relation {skel["key"]!r} ({skel["name"]!r}) "
+                            f"due removal of {value["dest"]["key"]!r} ({value["dest"]["name"]!r})"
+                        )
+                        value.clear()
 
-                # Copy over the refKey values using expanded bone names (_ref_keys),
-                # not raw refKeys patterns. refKeys may contain fnmatch wildcards
-                # (e.g. "delivery_time_*" → "delivery_time_min", "delivery_time_max",
-                # "delivery_time_range"). Iterating raw patterns would attempt
-                # target_skel["delivery_time_*"] which doesn't exist → copies None.
-                for key in self._ref_keys:
-                    value["dest"][key] = target_skel[key]
-                    # logging.debug(f"Refreshed {key=} to {value["dest"][key]!r} ({str(value["dest"][key])!r})")
+                    case _:
+                        logging.info(
+                            f"{name}: "
+                            f"Relation from {skel["key"]!r} ({skel["name"]!r}) "
+                            f"refers to deleted {value["dest"]["key"]!r} ({value["dest"]["name"]!r}), skipping"
+                        )
+
+                continue
+
+            target_skel = skeletonByKind(value["dest"].kindName)()
+            target_skel.setEntity(entity)
+
+            # Reset the dbEntity for a clean rewrite
+            value["dest"].dbEntity = None
+
+            # Copy over the refKey values using expanded bone names (_ref_keys),
+            # not raw refKeys patterns. refKeys may contain fnmatch wildcards
+            # (e.g. "delivery_time_*" → "delivery_time_min", "delivery_time_max",
+            # "delivery_time_range"). Iterating raw patterns would attempt
+            # target_skel["delivery_time_*"] which doesn't exist → copies None.
+            for key in self._ref_keys:
+                value["dest"][key] = target_skel[key]
+                # logging.debug(f"Refreshed {key=} to {value["dest"][key]!r} ({str(value["dest"][key])!r})")
 
     def refresh_copies(self, skel: "SkeletonInstance", name: str) -> None:
         """
